@@ -155,21 +155,21 @@ class MultiListener:
         if self.v6:
             self.v6.listen(backlog)
         if self.v4:
-            try:
-                self.v4.listen(backlog)
-            except socket.error as e:
-                # on some systems v4 bind will fail if the v6 succeeded,
-                # in this case the v6 socket will receive v4 too.
-                if e.errno == errno.EADDRINUSE and self.v6:
-                    self.v4 = None
-                else:
-                    raise e
+            self.v4.listen(backlog)
+
+    def close(self):
+        if self.v6:
+            self.v6.close()
+        if self.v4:
+            self.v4.close()
 
     def bind(self, address_v6, address_v4):
         assert not self.bind_called
         self.bind_called = True
         if address_v6 is not None:
             self.v6 = socket.socket(socket.AF_INET6, self.type, self.proto)
+            if os.name == "posix" and self.type == socket.SOCK_STREAM:
+                self.v6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if address_v4 is not None:
                 # IPv4 has its own listener; do not let IPv6 claim its port.
                 self.v6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
@@ -193,6 +193,8 @@ class MultiListener:
             self.v6 = None
         if address_v4 is not None:
             self.v4 = socket.socket(socket.AF_INET, self.type, self.proto)
+            if os.name == "posix" and self.type == socket.SOCK_STREAM:
+                self.v4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.v4.bind(address_v4)
         else:
             self.v4 = None
@@ -1013,7 +1015,7 @@ def main(listenip_v6, listenip_v4,
     feature_status("User", required.user, avail.user)
 
     # Exclude traffic destined to our listen addresses.
-    if required.ipv4 and \
+    if required.ipv4 and listenip_v4 and \
             not any(listenip_v4[0] == sex[1] for sex in subnets_v4):
         subnets_exclude.append((socket.AF_INET, listenip_v4[0], 32, 0, 0))
 
@@ -1068,8 +1070,9 @@ def main(listenip_v6, listenip_v4,
 
     # Track actual listener ports, including explicitly configured ports.
     used_ports = set()
-    if listenip_v6 and listenip_v6[1] and listenip_v4 and listenip_v4[1]:
-        # if both ports given, no need to search for a spare port
+    if not any(address and not address[1]
+               for address in (listenip_v6, listenip_v4)):
+        # All enabled listeners have explicit ports; try only once.
         ports = [0, ]
     else:
         # if at least one port missing, we have to search
@@ -1113,6 +1116,9 @@ def main(listenip_v6, listenip_v4,
             tcp_listener.bind(lv6, lv4)
             if udp_listener:
                 udp_listener.bind(lv6, lv4)
+            # With SO_REUSEADDR, a port another process just bound may only
+            # be reported as busy here, so this has to stay in the search.
+            tcp_listener.listen(10)
             bound = True
             used_ports.update(p for p in (redirectport_v6, redirectport_v4) if p)
             break
@@ -1120,13 +1126,17 @@ def main(listenip_v6, listenip_v4,
             if e.errno == errno.EADDRINUSE:
                 last_e = e
                 used_ports.update(p for p in (redirectport_v6, redirectport_v4) if p)
+                # last_e keeps this attempt's sockets alive through its
+                # traceback, and one of them may already be listening.
+                tcp_listener.close()
+                if udp_listener:
+                    udp_listener.close()
             else:
                 raise e
 
     if not bound:
         assert last_e
         raise last_e
-    tcp_listener.listen(10)
     tcp_listener.print_listening("TCP redirector")
     if udp_listener:
         udp_listener.print_listening("UDP redirector")
